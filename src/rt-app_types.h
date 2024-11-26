@@ -26,6 +26,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define _GNU_SOURCE
 #include <sched.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+
 #include <pthread.h>
 #include <limits.h>
 #include "config.h"
@@ -89,7 +95,9 @@ typedef enum resource_t
 	rtapp_runtime,
 	rtapp_yield,
 	rtapp_barrier,
-	rtapp_fork
+	rtapp_fork,
+
+	rtapp_net, // New task for network i/o
 } resource_t;
 
 struct _rtapp_mutex {
@@ -141,6 +149,11 @@ struct _rtapp_fork {
 	int nforks;
 };
 
+struct _rtapp_netdev {
+	int fd;
+	struct sockaddr_in dest_addr;
+};
+
 /* Shared resources */
 typedef struct _rtapp_resource_t {
 	union {
@@ -152,6 +165,7 @@ typedef struct _rtapp_resource_t {
 		struct _rtapp_iodev dev;
 		struct _rtapp_barrier_like barrier;
 		struct _rtapp_fork fork;
+		struct _rtapp_netdev net;
 	} res;
 	int index;
 	resource_t type;
@@ -264,6 +278,13 @@ typedef struct _log_data_t {
 	long slack;
 } log_data_t;
 
+typedef struct _rtapp_network_opts_t {
+	char *iface;
+	char *dest_ip;
+	int port;
+	int pkt_size;
+} rtapp_network_opts_t;
+
 typedef struct _rtapp_options_t {
 	int lock_pages;
 
@@ -289,6 +310,9 @@ typedef struct _rtapp_options_t {
 	char *io_device;
 
 	int cumulative_slack;
+
+	// NOTE(garbu): network options
+	rtapp_network_opts_t net_opts;
 } rtapp_options_t;
 
 typedef struct _timing_point_t {

@@ -620,6 +620,31 @@ static int run_event(event_data_t *event, int dry_run,
 			pthread_mutex_unlock(&fork_mutex);
 		}
 		break;
+		case rtapp_net:
+		{
+			log_debug("net %d", event->count);
+			
+			char packet[64];
+			memset(packet, 'a', sizeof(packet));
+
+			struct iovec iov;
+			iov.iov_base = packet;
+			iov.iov_len  = sizeof(packet);
+
+			struct msghdr msg;
+			memset(&msg, 0, sizeof(msg));
+			msg.msg_name    = &ddata->res.net.dest_addr;
+			msg.msg_namelen = sizeof(ddata->res.net.dest_addr);
+			msg.msg_iov     = &iov;
+			msg.msg_iovlen  = 1;
+
+			int ret = sendmsg(ddata->res.net.fd, &msg, 0);
+			if (ret == -1) {
+				perror("sendmsg");
+				exit(EXIT_FAILURE);
+			}
+		}
+		break;
 	default:
 		break;
 	}
@@ -756,7 +781,8 @@ static void __shutdown(bool force_terminate)
 }
 
 static void
-shutdown(int sig)
+// shutdown(int sig)
+rtapp_shutdown(int sig)
 {
 	__shutdown(true);
 }
@@ -1533,10 +1559,14 @@ int main(int argc, char* argv[])
 	pthread_mutex_init(&fork_mutex, NULL);
 
 	/* install a signal handler for proper shutdown */
-	signal(SIGQUIT, shutdown);
-	signal(SIGTERM, shutdown);
-	signal(SIGHUP, shutdown);
-	signal(SIGINT, shutdown);
+	// signal(SIGQUIT, shutdown);
+	// signal(SIGTERM, shutdown);
+	// signal(SIGHUP, shutdown);
+	// signal(SIGINT, shutdown);
+	signal(SIGQUIT, rtapp_shutdown);
+	signal(SIGTERM, rtapp_shutdown);
+	signal(SIGHUP, rtapp_shutdown);
+	signal(SIGINT, rtapp_shutdown);
 
 	/* If using ftrace, open trace and marker fds */
 	if (ftrace_level != FTRACE_NONE) {
