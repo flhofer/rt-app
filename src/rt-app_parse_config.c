@@ -257,6 +257,45 @@ static void init_barrier_resource(rtapp_resource_t *data, const rtapp_options_t 
 	pthread_cond_init(&data->res.barrier.c_obj, NULL);
 }
 
+static void init_net_resource(rtapp_resource_t *data, const rtapp_options_t *opts)
+{
+	log_info(PIN3 "Init: %s net", data->name);
+
+	int port = opts->net_opts.port;
+	const char *ifname = opts->net_opts.iface;
+
+	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    struct sockaddr_in addr;
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("bind");
+        exit(1);
+    }
+
+    // bind to device
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, (void *)&ifr, sizeof(ifr)) == -1) {
+        perror("setsockopt");
+        exit(1);
+    }
+
+	struct _rtapp_netdev *net = &data->res.net;
+	net->fd = sockfd;
+	net->dest_addr.sin_addr.s_addr = inet_addr(opts->net_opts.dest_ip);
+	net->dest_addr.sin_family = AF_INET;
+	net->dest_addr.sin_port = htons(port);
+}
+
 static void
 init_resource_data(const char *name, int type, rtapp_resources_t *resources_table,
 		int idx, const rtapp_options_t *opts)
@@ -287,6 +326,9 @@ init_resource_data(const char *name, int type, rtapp_resources_t *resources_tabl
 			break;
 		case rtapp_barrier:
 			init_barrier_resource(data, opts);
+			break;
+		case rtapp_net:
+			init_net_resource(data, opts);
 			break;
 		default:
 			break;
@@ -428,6 +470,23 @@ parse_task_event_data(char *name, struct json_object *obj,
 	char *tmp;
 	long tag = (long)tdata;
 	int i;
+
+	// NOTE(garbu): Parse the new added event (net)
+	// net is just an integer value
+	if (!strncmp(name, "net", strlen("net"))) {
+		if (!json_object_is_type(obj, json_type_int))
+			goto unknown_event;
+
+		data->type = rtapp_net;
+		data->count = json_object_get_int(obj);
+
+		i = get_resource_index("network", rtapp_net, resources_table, opts);
+		data->dep = i;
+
+		log_info(PIN2 "type %d count %d", data->type, data->count);
+		strncpy(data->name, name, sizeof(data->name)-1);
+		return;
+	}
 
 	if (!strncmp(name, "run", strlen("run")) ||
 			!strncmp(name, "sleep", strlen("sleep"))) {
@@ -732,6 +791,7 @@ static char *events[] = {
 	"yield",
 	"barrier",
 	"fork",
+	"net", // NOTE(garbu): new event type for network
 	NULL
 };
 
@@ -1188,6 +1248,51 @@ parse_tasks(struct json_object *tasks, rtapp_options_t *opts)
 }
 
 static void
+parse_network(struct json_object *network, rtapp_options_t *opts)
+{
+	// Example of network configuration
+	// {
+	// 	"network": {
+	// 		"iface": "eth0",
+	// 		"remote": "192.168.1.1",
+	// 		"port": 1234,
+	// 		"pkt_size": 1024
+	// 	}
+	// 
+
+	struct json_object *tmp_obj;
+	char *tmp_str;
+
+	log_info(PFX "Parsing network section");
+
+	tmp_obj = get_in_object(network, "iface", TRUE);
+	if (tmp_obj == NULL) {
+		/* no setting ? disable network */
+		opts->net_opts.iface = NULL;
+		log_error("missing network setting force disable");
+	} else {
+		opts->net_opts.iface = get_string_value_from(network, "iface", TRUE, "eth0");
+		log_debug("iface %s", opts->net_opts.iface);
+	}
+
+	tmp_obj = get_in_object(network, "remote", TRUE);
+	if (tmp_obj == NULL) {
+		/* no setting ? disable network */
+		opts->net_opts.dest_ip = NULL;
+		log_error("missing network setting force disable");
+	} else {
+		opts->net_opts.dest_ip = get_string_value_from(network, "remote", TRUE, "127.0.0.1");
+		log_debug("remote %s", opts->net_opts.dest_ip);
+	}
+
+	opts->net_opts.port = get_int_value_from(network, "port", TRUE, 1234);
+	log_debug("port %d", opts->net_opts.port);
+
+	opts->net_opts.pkt_size = get_int_value_from(network, "pkt_size", TRUE, 1024);
+	log_debug("pkt_size %d", opts->net_opts.pkt_size);
+}
+
+static void
 parse_global(struct json_object *global, rtapp_options_t *opts)
 {
 	char *policy, *tmp_str;
@@ -1290,6 +1395,16 @@ parse_global(struct json_object *global, rtapp_options_t *opts)
 			 */
 			free(tmp_str);
 		}
+	}
+
+	tmp_obj = get_in_object(global, "network", TRUE);
+	if (tmp_obj == NULL) {
+		/* no setting ? disable network */
+		opts->net_opts.iface = NULL;
+		log_error("missing network setting force disable");
+	} else {
+		log_debug("Parsing network section");
+		parse_network(tmp_obj, opts);
 	}
 
 	opts->logdir = get_string_value_from(global, "logdir", TRUE, "./");
