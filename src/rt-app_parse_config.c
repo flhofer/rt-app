@@ -289,11 +289,13 @@ static void init_net_resource(rtapp_resource_t *data, const rtapp_options_t *opt
         exit(1);
     }
 
-	struct _rtapp_netdev *net = &data->res.net;
+	struct _rtapp_net *net = &data->res.net;
 	net->fd = sockfd;
 	net->dest_addr.sin_addr.s_addr = inet_addr(opts->net_opts.dest_ip);
 	net->dest_addr.sin_family = AF_INET;
 	net->dest_addr.sin_port = htons(port);
+
+	data->res.net.pkt_size = opts->net_opts.pkt_size;
 }
 
 static void
@@ -1307,7 +1309,7 @@ parse_global(struct json_object *global, rtapp_options_t *opts)
 		opts->gnuplot = 0;
 		opts->policy = other;
 		opts->calib_cpu = 0;
-		opts->calib_ns_per_loop = 0;
+		opts->calib_ps_per_loop = 0;
 		opts->logdir = strdup("./");
 		opts->logbasename = strdup("rt-app");
 		opts->logsize = 0;
@@ -1337,13 +1339,17 @@ parse_global(struct json_object *global, rtapp_options_t *opts)
 	if (tmp_obj == NULL) {
 		/* no setting ? Calibrate CPU0 */
 		opts->calib_cpu = 0;
-		opts->calib_ns_per_loop = 0;
+		opts->calib_ps_per_loop = 0;
 		log_error("missing calibration setting force CPU0");
 	} else {
 		if (json_object_is_type(tmp_obj, json_type_int)) {
-			/* integer (no " ") detected. */
-			opts->calib_ns_per_loop = json_object_get_int(tmp_obj);
-			log_debug("ns_per_loop %d", opts->calib_ns_per_loop);
+			/* integer (no " " and ".") detected. */
+			opts->calib_ps_per_loop = json_object_get_int(tmp_obj) * 1000;
+			log_debug("ns_per_loop %ld.%03ld", opts->calib_ps_per_loop / 1000, opts->calib_ps_per_loop % 1000);		
+		} else if (json_object_is_type(tmp_obj, json_type_double)) {
+			/* double (no " ") detected. */
+			opts->calib_ps_per_loop = (long) (json_object_get_double(tmp_obj) * 1000.0);
+			log_debug("ns_per_loop %ld.%03ld", opts->calib_ps_per_loop / 1000, opts->calib_ps_per_loop % 1000);		
 		} else {
 			/* Get CPU number */
 			tmp_str = get_string_value_from(global, "calibration",

@@ -55,7 +55,7 @@ static volatile sig_atomic_t continue_running;
 static pthread_data_t *threads;
 static int nthreads;
 static volatile sig_atomic_t running_threads;
-static int p_load;
+static long p_load;
 rtapp_options_t opts;
 static struct timespec t_zero;
 static struct timespec t_start;
@@ -70,6 +70,7 @@ static ftrace_data_t ft_data = {
 
 void *thread_body(void *arg);
 void setup_thread_logging(thread_data_t *tdata);
+void setup_thread_network_monitoring(thread_data_t *tdata);
 
 static thread_data_t *find_thread_data(const char *name, rtapp_options_t *opts)
 {
@@ -187,6 +188,9 @@ static int create_thread(const thread_data_t *td, int index, int forked, int nfo
 
 	setup_thread_logging(tdata);
 
+	/* Setup csv file to save thread network stats */
+	setup_thread_network_monitoring(tdata);
+
 	/* save a pointer to thread's data */
 	threads[index].data = tdata;
 
@@ -225,12 +229,12 @@ void waste_cpu_cycles(unsigned long long load_loops)
 * We alternate idle period and run period in order to not trig some hw
 * protection mechanism like thermal mitgation
 */
-int calibrate_cpu_cycles_1(int clock)
+long calibrate_cpu_cycles_1(int clock)
 {
 	struct timespec start, stop, sleep;
 	int max_load_loop = 10000;
-	unsigned int diff;
-	int nsec_per_loop, avg_per_loop = 0;
+	ulong diff;
+	long psec_per_loop, avg_per_loop = 0;
 	int cal_trial = 1000;
 
 	while (cal_trial) {
@@ -244,12 +248,12 @@ int calibrate_cpu_cycles_1(int clock)
 		waste_cpu_cycles(max_load_loop);
 		clock_gettime(clock, &stop);
 
-		diff = (int)timespec_sub_to_ns(&stop, &start);
-		nsec_per_loop = diff / max_load_loop;
-		avg_per_loop = (avg_per_loop + nsec_per_loop) >> 1;
+		diff = (ulong)timespec_sub_to_ns(&stop, &start);
+		psec_per_loop = diff * 1000 / max_load_loop;
+		avg_per_loop = (avg_per_loop + psec_per_loop) >> 1;
 
 		/* collect a critical mass of samples.*/
-		if ((abs(nsec_per_loop - avg_per_loop) * 50)  < avg_per_loop)
+		if ((abs(psec_per_loop - avg_per_loop) * 50)  < avg_per_loop)
 			return avg_per_loop;
 
 		/*
@@ -270,12 +274,12 @@ int calibrate_cpu_cycles_1(int clock)
 * We continously runs something to ensure that CPU is set to max freq by the
 * governor
 */
-int calibrate_cpu_cycles_2(int clock)
+long calibrate_cpu_cycles_2(int clock)
 {
 	struct timespec start, stop;
 	int max_load_loop = 10000;
-	unsigned int diff;
-	int nsec_per_loop, avg_per_loop = 0;
+	ulong diff;
+	long psec_per_loop, avg_per_loop = 0;
 	int cal_trial = 1000;
 
 	while (cal_trial) {
@@ -285,12 +289,12 @@ int calibrate_cpu_cycles_2(int clock)
 		waste_cpu_cycles(max_load_loop);
 		clock_gettime(clock, &stop);
 
-		diff = (int)timespec_sub_to_ns(&stop, &start);
-		nsec_per_loop = diff / max_load_loop;
-		avg_per_loop = (avg_per_loop + nsec_per_loop) >> 1;
+		diff = (ulong)timespec_sub_to_ns(&stop, &start);
+		psec_per_loop = diff * 1000 / max_load_loop;
+		avg_per_loop = (avg_per_loop + psec_per_loop) >> 1;
 
 		/* collect a critical mass of samples.*/
-		if ((abs(nsec_per_loop - avg_per_loop) * 50)  < avg_per_loop)
+		if ((abs(psec_per_loop - avg_per_loop) * 50)  < avg_per_loop)
 			return avg_per_loop;
 
 		/*
@@ -310,9 +314,9 @@ int calibrate_cpu_cycles_2(int clock)
 * Use several methods to calibrate the ns per loop and get the min value which
 * correspond to the highest achievable compute capacity.
 */
-int calibrate_cpu_cycles(int clock)
+long calibrate_cpu_cycles(int clock)
 {
-	int calib1, calib2;
+	long calib1, calib2;
 
 	/* Run 1st method */
 	calib1 = calibrate_cpu_cycles_1(clock);
@@ -337,7 +341,7 @@ static inline unsigned long loadwait(unsigned long exec)
 	 * phase. We need to compute it here because both load_count and exec
 	 * might be modified below.
 	 */
-	perf = exec / p_load;
+	perf = exec * 1000 / p_load;
 
 	/*
 	 * If exec is still too big, let's run it in bursts
@@ -346,7 +350,7 @@ static inline unsigned long loadwait(unsigned long exec)
 	secs = exec / 1000000;
 
 	for (i = 0; i < secs; i++) {
-		load_count = 1000000000/p_load;
+		load_count = 1000000000000/p_load;
 		waste_cpu_cycles(load_count);
 		exec -= 1000000;
 	}
@@ -354,7 +358,7 @@ static inline unsigned long loadwait(unsigned long exec)
 	/*
 	 * Run for the remainig exec (if any).
 	 */
-	load_count = (exec * 1000)/p_load;
+	load_count = (exec * 1000000)/p_load;
 	waste_cpu_cycles(load_count);
 
 	return perf;
@@ -622,27 +626,59 @@ static int run_event(event_data_t *event, int dry_run,
 		break;
 		case rtapp_net:
 		{
+			static __u64 pkt_count = 0;
+
+			char packet_buffer[1024];
+			struct timespec t_start, t_tx_end, t_rx_end, t_diff;
+			__u64 time_tx_start, time_tx_end, time_rx_end;
+	
 			log_debug("net %d", event->count);
 			
-			char packet[64];
-			memset(packet, 'a', sizeof(packet));
+			net_data_t *data = (net_data_t *)packet_buffer;
+			data->pkt_id = pkt_count;
 
-			struct iovec iov;
-			iov.iov_base = packet;
-			iov.iov_len  = sizeof(packet);
+			struct iovec iov = {
+				.iov_base = packet_buffer,
+				.iov_len = ddata->res.net.pkt_size,
+			};
 
-			struct msghdr msg;
-			memset(&msg, 0, sizeof(msg));
-			msg.msg_name    = &ddata->res.net.dest_addr;
-			msg.msg_namelen = sizeof(ddata->res.net.dest_addr);
-			msg.msg_iov     = &iov;
-			msg.msg_iovlen  = 1;
+			struct msghdr msg = {
+				.msg_control = NULL,
+				.msg_controllen = 0,
+				.msg_name = &ddata->res.net.dest_addr,
+				.msg_namelen = sizeof(ddata->res.net.dest_addr),
+				.msg_iov = &iov,
+				.msg_iovlen = 1,
+			};
 
+			clock_gettime(CLOCK_MONOTONIC, &t_start);
 			int ret = sendmsg(ddata->res.net.fd, &msg, 0);
 			if (ret == -1) {
-				perror("sendmsg");
+				log_error("Failed to send message");
 				exit(EXIT_FAILURE);
 			}
+
+			clock_gettime(CLOCK_MONOTONIC, &t_tx_end);
+
+			memset(packet_buffer, 0, sizeof(packet_buffer));
+			ret = recvmsg(ddata->res.net.fd, &msg, 0);
+			if (ret == -1) {
+				log_error("Failed to receive message");
+			}
+
+			clock_gettime(CLOCK_MONOTONIC, &t_rx_end);
+
+			time_tx_start = timespec_to_nsec(&t_start);
+			time_tx_end = timespec_to_nsec(&t_tx_end);
+			time_rx_end = timespec_to_nsec(&t_rx_end);
+
+			// id,time_tx_start,time_tx_end,time_rx_end,tx_duration,rx_duration,rtt
+			__u64 tx_duration = time_tx_end - time_tx_start;
+			__u64 rx_duration = time_rx_end - time_tx_end;
+			__u64 rtt = time_rx_end - time_tx_start;
+
+			fprintf(tdata->netstats_handler, "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+				pkt_count++, time_tx_start, time_tx_end, time_rx_end, tx_duration, rx_duration, rtt);
 		}
 		break;
 	default:
@@ -1404,6 +1440,29 @@ void setup_thread_logging(thread_data_t *tdata)
 	}
 }
 
+void setup_thread_network_monitoring(thread_data_t *tdata)
+{
+	char tmp[PATH_LENGTH];
+	memset(tmp, 0, sizeof(tmp));
+
+	if (opts.logdir) {
+		snprintf(tmp, PATH_LENGTH, "%s/%s-%s-netstats.csv",
+			 opts.logdir,
+			 opts.logbasename,
+			 tdata->name);
+		tdata->netstats_handler = fopen(tmp, "w");
+		if (!tdata->netstats_handler) {
+			log_error("Cannot open network logfile %s", tmp);
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		tdata->netstats_handler = stdout;
+	}
+
+	fprintf(tdata->netstats_handler, 
+		"id,time_tx_start,time_tx_end,time_rx_end,tx_duration,rx_duration,rtt\n");
+}
+
 void setup_thread_gnuplot(thread_data_t *tdata)
 {
 	FILE *gnuplot_script = NULL;
@@ -1602,7 +1661,7 @@ int main(int argc, char* argv[])
 	continue_running = 1;
 
 	/* Needs to calibrate 'calib_cpu' core */
-	if (opts.calib_ns_per_loop == 0) {
+	if (opts.calib_ps_per_loop == 0) {
 		log_notice("Calibrate ns per loop");
 		cpu_set_t calib_set;
 
@@ -1612,10 +1671,10 @@ int main(int argc, char* argv[])
 		sched_setaffinity(0, sizeof(cpu_set_t), &calib_set);
 		p_load = calibrate_cpu_cycles(CLOCK_MONOTONIC);
 		sched_setaffinity(0, sizeof(cpu_set_t), &orig_set);
-		log_notice("pLoad = %dns : calib_cpu %d", p_load, opts.calib_cpu);
+		log_notice("pLoad = %ld.%03ldns : calib_cpu %d", p_load / 1000, p_load % 1000, opts.calib_cpu);
 	} else {
-		p_load = opts.calib_ns_per_loop;
-		log_notice("pLoad = %dns", p_load);
+		p_load = opts.calib_ps_per_loop;
+		log_notice("pLoad = %ld.%03ldns", p_load / 1000, p_load % 1000 );
 	}
 
 	initialize_cgroups();

@@ -149,9 +149,10 @@ struct _rtapp_fork {
 	int nforks;
 };
 
-struct _rtapp_netdev {
+struct _rtapp_net {
 	int fd;
 	struct sockaddr_in dest_addr;
+	int pkt_size;
 };
 
 /* Shared resources */
@@ -165,7 +166,7 @@ typedef struct _rtapp_resource_t {
 		struct _rtapp_iodev dev;
 		struct _rtapp_barrier_like barrier;
 		struct _rtapp_fork fork;
-		struct _rtapp_netdev net;
+		struct _rtapp_net net;
 	} res;
 	int index;
 	resource_t type;
@@ -248,6 +249,7 @@ typedef struct _thread_data_t {
 	struct timespec main_app_start;
 
 	FILE *log_handler;
+	FILE *netstats_handler;
 
 	unsigned long delay;
 
@@ -278,6 +280,11 @@ typedef struct _log_data_t {
 	long slack;
 } log_data_t;
 
+typedef struct _net_data_t {
+	// TODO(garbu): add network data
+	unsigned long pkt_id;
+} net_data_t;
+
 typedef struct _rtapp_network_opts_t {
 	char *iface;
 	char *dest_ip;
@@ -300,7 +307,7 @@ typedef struct _rtapp_options_t {
 	int logsize;
 	int gnuplot;
 	int calib_cpu;
-	int calib_ns_per_loop;
+	long calib_ps_per_loop; // option b
 
 	rtapp_resources_t *resources;
 	int pi_enabled;
