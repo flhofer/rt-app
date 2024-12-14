@@ -289,11 +289,13 @@ static void init_net_resource(rtapp_resource_t *data, const rtapp_options_t *opt
         exit(1);
     }
 
-	struct _rtapp_netdev *net = &data->res.net;
+	struct _rtapp_net *net = &data->res.net;
 	net->fd = sockfd;
 	net->dest_addr.sin_addr.s_addr = inet_addr(opts->net_opts.dest_ip);
 	net->dest_addr.sin_family = AF_INET;
 	net->dest_addr.sin_port = htons(port);
+
+	data->res.net.pkt_size = opts->net_opts.pkt_size;
 }
 
 static void

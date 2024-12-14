@@ -70,6 +70,7 @@ static ftrace_data_t ft_data = {
 
 void *thread_body(void *arg);
 void setup_thread_logging(thread_data_t *tdata);
+void setup_thread_network_monitoring(thread_data_t *tdata);
 
 static thread_data_t *find_thread_data(const char *name, rtapp_options_t *opts)
 {
@@ -186,6 +187,9 @@ static int create_thread(const thread_data_t *td, int index, int forked, int nfo
 		return -1;
 
 	setup_thread_logging(tdata);
+
+	/* Setup csv file to save thread network stats */
+	setup_thread_network_monitoring(tdata);
 
 	/* save a pointer to thread's data */
 	threads[index].data = tdata;
@@ -622,27 +626,59 @@ static int run_event(event_data_t *event, int dry_run,
 		break;
 		case rtapp_net:
 		{
+			static __u64 pkt_count = 0;
+
+			char packet_buffer[1024];
+			struct timespec t_start, t_tx_end, t_rx_end, t_diff;
+			__u64 time_tx_start, time_tx_end, time_rx_end;
+	
 			log_debug("net %d", event->count);
 			
-			char packet[64];
-			memset(packet, 'a', sizeof(packet));
+			net_data_t *data = (net_data_t *)packet_buffer;
+			data->pkt_id = pkt_count;
 
-			struct iovec iov;
-			iov.iov_base = packet;
-			iov.iov_len  = sizeof(packet);
+			struct iovec iov = {
+				.iov_base = packet_buffer,
+				.iov_len = ddata->res.net.pkt_size,
+			};
 
-			struct msghdr msg;
-			memset(&msg, 0, sizeof(msg));
-			msg.msg_name    = &ddata->res.net.dest_addr;
-			msg.msg_namelen = sizeof(ddata->res.net.dest_addr);
-			msg.msg_iov     = &iov;
-			msg.msg_iovlen  = 1;
+			struct msghdr msg = {
+				.msg_control = NULL,
+				.msg_controllen = 0,
+				.msg_name = &ddata->res.net.dest_addr,
+				.msg_namelen = sizeof(ddata->res.net.dest_addr),
+				.msg_iov = &iov,
+				.msg_iovlen = 1,
+			};
 
+			clock_gettime(CLOCK_MONOTONIC, &t_start);
 			int ret = sendmsg(ddata->res.net.fd, &msg, 0);
 			if (ret == -1) {
-				perror("sendmsg");
+				log_error("Failed to send message");
 				exit(EXIT_FAILURE);
 			}
+
+			clock_gettime(CLOCK_MONOTONIC, &t_tx_end);
+
+			memset(packet_buffer, 0, sizeof(packet_buffer));
+			ret = recvmsg(ddata->res.net.fd, &msg, 0);
+			if (ret == -1) {
+				log_error("Failed to receive message");
+			}
+
+			clock_gettime(CLOCK_MONOTONIC, &t_rx_end);
+
+			time_tx_start = timespec_to_nsec(&t_start);
+			time_tx_end = timespec_to_nsec(&t_tx_end);
+			time_rx_end = timespec_to_nsec(&t_rx_end);
+
+			// id,time_tx_start,time_tx_end,time_rx_end,tx_duration,rx_duration,rtt
+			__u64 tx_duration = time_tx_end - time_tx_start;
+			__u64 rx_duration = time_rx_end - time_tx_end;
+			__u64 rtt = time_rx_end - time_tx_start;
+
+			fprintf(tdata->netstats_handler, "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+				pkt_count++, time_tx_start, time_tx_end, time_rx_end, tx_duration, rx_duration, rtt);
 		}
 		break;
 	default:
@@ -1402,6 +1438,29 @@ void setup_thread_logging(thread_data_t *tdata)
 	} else {
 		tdata->log_handler = stdout;
 	}
+}
+
+void setup_thread_network_monitoring(thread_data_t *tdata)
+{
+	char tmp[PATH_LENGTH];
+	memset(tmp, 0, sizeof(tmp));
+
+	if (opts.logdir) {
+		snprintf(tmp, PATH_LENGTH, "%s/%s-%s-netstats.csv",
+			 opts.logdir,
+			 opts.logbasename,
+			 tdata->name);
+		tdata->netstats_handler = fopen(tmp, "w");
+		if (!tdata->netstats_handler) {
+			log_error("Cannot open network logfile %s", tmp);
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		tdata->netstats_handler = stdout;
+	}
+
+	fprintf(tdata->netstats_handler, 
+		"id,time_tx_start,time_tx_end,time_rx_end,tx_duration,rx_duration,rtt\n");
 }
 
 void setup_thread_gnuplot(thread_data_t *tdata)

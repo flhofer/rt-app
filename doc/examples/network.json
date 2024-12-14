@@ -1,0 +1,33 @@
+{
+    "tasks": {
+        "thread0": {
+            "instance": 1,
+            "loop": -1,
+            "priority": 90,
+            "cpus": [
+                1
+            ],
+            "timer": {
+                "ref": "unique_net",
+                "period": 1000
+            },
+            "net": 1
+        }
+    },
+    "global": {
+        "duration": 2,
+        "calibration": "CPU0",
+        "default_policy": "SCHED_FIFO",
+        "pi_enabled": false,
+        "lock_pages": true,
+        "logdir": "./",
+        "log_basename": "rt-app",
+        "gnuplot": false,
+        "network": {
+            "iface": "enp7s0",
+            "remote": "10.0.10.20",
+            "port": 9999,
+            "pkt_size": 256
+        }
+    }
+}
