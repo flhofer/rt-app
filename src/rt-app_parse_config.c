@@ -26,6 +26,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <string.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <json-c/json.h>
 
 #include "rt-app_utils.h"
@@ -229,6 +230,105 @@ static void init_membuf_resource(rtapp_resource_t *data, const rtapp_options_t *
 	data->res.buf.size = opts->mem_buffer_size;
 }
 
+/*
+ * Per-type init parameters threaded through get_resource_index ->
+ * add_resource_data -> init_resource_data so all per-type init lives
+ * in init_resource_data's switch. Caller fills in only the relevant
+ * member based on the resource type. May be NULL for param-free types
+ * (mutex, timer, wait, barrier, sem, iorun, legacy mem).
+ */
+union init_args {
+	struct {
+		int size;
+		int stride;
+		int random;
+	} chase;
+	struct {
+		int size;
+	} membuf;
+};
+
+static void init_membuf_resource_sized(rtapp_resource_t *data, int size)
+{
+	log_info(PIN3 "Init: %s membuf (size %d)", data->name, size);
+
+	data->res.buf.ptr = malloc(size);
+	data->res.buf.size = size;
+	if (data->res.buf.ptr)
+		memset(data->res.buf.ptr, 0xAA, size);
+}
+
+/*
+ * Bit-reverse an integer across nbits.
+ * E.g., bitreverse(1, 3) = 4 (001 -> 100)
+ */
+static inline unsigned int bitreverse(unsigned int val, int nbits)
+{
+	unsigned int result = 0;
+	int j;
+
+	for (j = 0; j < nbits; j++)
+		if (val & (1u << j))
+			result |= (1u << (nbits - j - 1));
+
+	return result;
+}
+
+/*
+ * Allocate the chase buffer and build its pointer chain.
+ *
+ * random=1: bit-reversed order to defeat hardware prefetchers.
+ * random=0: sequential stride.
+ */
+static void init_memchase_resource(rtapp_resource_t *data, int size, int stride, int random)
+{
+	struct _rtapp_mem_chase_buf *chase = &data->res.chase;
+	size_t npos;
+	int nbits;
+	size_t i;
+	char *base;
+
+	log_info(PIN3 "Init: %s mem_chase (size %d, stride %d, %s)", data->name,
+		 size, stride, random ? "random" : "sequential");
+
+	chase->size = size;
+	chase->stride = stride;
+	chase->random = random;
+
+	npos = (size_t)size / (size_t)stride;
+	/* Round down to power of 2 for bit-reversal */
+	for (nbits = 0; (1u << (nbits + 1)) <= npos; nbits++)
+		;
+	npos = 1u << nbits;
+
+	if (npos < 2) {
+		log_error("mem_chase buffer too small (need at least 2 * stride)");
+		return;
+	}
+
+	base = malloc(npos * (size_t)stride);
+	if (!base) {
+		log_error("Failed to allocate mem_chase buffer (%zu bytes)",
+			  npos * (size_t)stride);
+		return;
+	}
+	chase->base = base;
+
+	if (random) {
+		/* Bit-reversed pointer chain */
+		for (i = 0; i < npos; i++) {
+			size_t src_off = (size_t)bitreverse(i, nbits) * stride;
+			size_t dst_off = (size_t)bitreverse((i + 1) % npos, nbits) * stride;
+			*(char **)(base + src_off) = base + dst_off;
+		}
+	} else {
+		/* Sequential pointer chain */
+		for (i = 0; i < npos - 1; i++)
+			*(char **)(base + i * stride) = base + (i + 1) * stride;
+		*(char **)(base + (npos - 1) * stride) = base;
+	}
+}
+
 static void init_iodev_resource(rtapp_resource_t *data, const rtapp_options_t *opts)
 {
 	log_info(PIN3 "Init: %s io device", data->name);
@@ -257,9 +357,16 @@ static void init_barrier_resource(rtapp_resource_t *data, const rtapp_options_t 
 	pthread_cond_init(&data->res.barrier.c_obj, NULL);
 }
 
+static void init_sem_resource(rtapp_resource_t *data, const rtapp_options_t *opts)
+{
+	log_info(PIN3 "Init: %s semaphore", data->name);
+	sem_init(&data->res.sem.obj, 0, 0);
+}
+
 static void
 init_resource_data(const char *name, int type, rtapp_resources_t *resources_table,
-		int idx, const rtapp_options_t *opts)
+		int idx, const rtapp_options_t *opts,
+		const union init_args *args)
 {
 	rtapp_resource_t *data = &(resources_table->resources[idx]);
 
@@ -282,11 +389,24 @@ init_resource_data(const char *name, int type, rtapp_resources_t *resources_tabl
 		case rtapp_mem:
 			init_membuf_resource(data, opts);
 			break;
+		case rtapp_mem_write:
+		case rtapp_mem_read:
+			init_membuf_resource_sized(data, args->membuf.size);
+			break;
+		case rtapp_mem_chase:
+			init_memchase_resource(data, args->chase.size,
+					       args->chase.stride,
+					       args->chase.random);
+			break;
 		case rtapp_iorun:
 			init_iodev_resource(data, opts);
 			break;
 		case rtapp_barrier:
 			init_barrier_resource(data, opts);
+			break;
+		case rtapp_sem_wait:
+		case rtapp_sem_post:
+			init_sem_resource(data, opts);
 			break;
 		default:
 			break;
@@ -316,11 +436,18 @@ parse_resource_data(const char *name, struct json_object *obj, int idx,
 	 */
 	free(type);
 
-	init_resource_data(name, data->type, opts->resources, idx, opts);
+	/*
+	 * The top-level "resources" block doesn't accept memrun types
+	 * (string_to_resource only knows mutex/wait/timer/etc.), so the
+	 * memrun cases in init_resource_data's switch are unreachable
+	 * via this path. NULL args is therefore safe.
+	 */
+	init_resource_data(name, data->type, opts->resources, idx, opts, NULL);
 }
 
 static int
-add_resource_data(const char *name, int type, rtapp_resources_t **resources_table, rtapp_options_t *opts)
+add_resource_data(const char *name, int type, rtapp_resources_t **resources_table,
+		rtapp_options_t *opts, const union init_args *args)
 {
 	int idx, size;
 	rtapp_resources_t *table = *resources_table;
@@ -344,7 +471,7 @@ add_resource_data(const char *name, int type, rtapp_resources_t **resources_tabl
 	 * We can't reuse table as *resources_table might have changed following
 	 * realloc
 	 */
-	init_resource_data(name, type, *resources_table, idx, opts);
+	init_resource_data(name, type, *resources_table, idx, opts, args);
 
 	return idx;
 }
@@ -395,7 +522,35 @@ parse_resources(struct json_object *resources, rtapp_options_t *opts)
 	}
 }
 
-static int get_resource_index(const char *name, int type, rtapp_resources_t **resources_table, rtapp_options_t *opts)
+/*
+ * Verify that a previously-created resource was initialized with the
+ * same params the current caller is asking for. Mismatches happen when
+ * two memrun events share a name (typically via "ref") but disagree on
+ * size/stride/pattern. Returns 1 on match, 0 on mismatch. For
+ * param-free types, or when no args are passed, always matches.
+ */
+static int validate_init_args(const rtapp_resource_t *r,
+		const union init_args *args)
+{
+	if (!args)
+		return 1;
+
+	switch (r->type) {
+	case rtapp_mem_chase:
+		return r->res.chase.size == (size_t)args->chase.size &&
+		       r->res.chase.stride == (size_t)args->chase.stride &&
+		       r->res.chase.random == args->chase.random;
+	case rtapp_mem_read:
+	case rtapp_mem_write:
+		return r->res.buf.size == args->membuf.size;
+	default:
+		return 1;
+	}
+}
+
+static int get_resource_index(const char *name, int type,
+		const union init_args *args,
+		rtapp_resources_t **resources_table, rtapp_options_t *opts)
 {
 	int nresources = (*resources_table)->nresources;
 	rtapp_resource_t *resources = (*resources_table)->resources;
@@ -406,7 +561,20 @@ static int get_resource_index(const char *name, int type, rtapp_resources_t **re
 		i++;
 
 	if (i >= nresources)
-		i = add_resource_data(name, type, resources_table, opts);
+		return add_resource_data(name, type, resources_table, opts, args);
+
+	/*
+	 * Existing resource: make sure the caller's params match. For
+	 * per-thread memrun the encoded resource name guarantees identical
+	 * params, so this is a defensive no-op. With user-provided "ref",
+	 * this catches accidental param mismatches across threads.
+	 */
+	if (!validate_init_args(&resources[i], args)) {
+		log_critical(PFX "Resource '%s' shared with mismatched params. "
+		             "Multiple memrun events using the same name (or "
+		             "\"ref\") must agree on size/stride/pattern.", name);
+		exit(EXIT_INV_CONFIG);
+	}
 
 	return i;
 }
@@ -423,7 +591,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 {
 	rtapp_resources_t **resources_table = tdata->global_resources;
 	rtapp_resource_t *rdata, *ddata;
-	char unique_name[22];
+	char unique_name[64];
 	const char *ref;
 	char *tmp;
 	long tag = (long)tdata;
@@ -449,6 +617,90 @@ parse_task_event_data(char *name, struct json_object *obj,
 		return;
 	}
 
+	if (!strncmp(name, "memrun", strlen("memrun"))) {
+		if (!json_object_is_type(obj, json_type_object))
+			goto unknown_event;
+
+		char *mem_type = get_string_value_from(obj, "type", FALSE, NULL);
+		int mem_size = get_int_value_from(obj, "size", FALSE, 0);
+		int mem_count = get_int_value_from(obj, "count", FALSE, 0);
+		/*
+		 * Optional "ref" field: when provided, the resource name is the
+		 * user's ref string verbatim: no per-thread tag, no params
+		 * encoding. Multiple threads (and tasks) using the same ref
+		 * share one underlying buffer. Without "ref", default per-thread
+		 * isolation via encoded params + tag.
+		 */
+		tmp = get_string_value_from(obj, "ref", TRUE, NULL);
+
+		if (!strcmp(mem_type, "chase")) {
+			char *pattern = get_string_value_from(obj, "pattern", TRUE, "random");
+			int is_random = strcmp(pattern, "sequential") != 0;
+			int stride = get_int_value_from(obj, "stride", TRUE, 64);
+			char encoded[48];
+			union init_args ia = { .chase = { mem_size, stride, is_random } };
+
+			if (tmp) {
+				ref = tmp;
+			} else {
+				/*
+				 * Encode chase params into the resource name so distinct
+				 * (size, stride, pattern) combos get distinct buffers
+				 * within one task, while identical configs share one.
+				 */
+				snprintf(encoded, sizeof(encoded), "memrun_%c_%d_%d",
+				         is_random ? 'r' : 's', stride, mem_size);
+				ref = create_unique_name(unique_name, sizeof(unique_name),
+				                         encoded, tag);
+			}
+
+			data->res = get_resource_index(ref, rtapp_mem_chase, &ia,
+			                               resources_table, opts);
+			data->count = mem_count;
+			data->type = rtapp_mem_chase;
+			free(pattern);
+		} else if (!strcmp(mem_type, "read")) {
+			char encoded[48];
+			union init_args ia = { .membuf = { mem_size } };
+
+			if (tmp) {
+				ref = tmp;
+			} else {
+				snprintf(encoded, sizeof(encoded), "memrun_read_%d", mem_size);
+				ref = create_unique_name(unique_name, sizeof(unique_name),
+				                         encoded, tag);
+			}
+			data->res = get_resource_index(ref, rtapp_mem_read, &ia,
+			                               resources_table, opts);
+			data->count = mem_count;
+			data->type = rtapp_mem_read;
+		} else if (!strcmp(mem_type, "write")) {
+			char encoded[48];
+			union init_args ia = { .membuf = { mem_size } };
+
+			if (tmp) {
+				ref = tmp;
+			} else {
+				snprintf(encoded, sizeof(encoded), "memrun_write_%d", mem_size);
+				ref = create_unique_name(unique_name, sizeof(unique_name),
+				                         encoded, tag);
+			}
+			data->res = get_resource_index(ref, rtapp_mem_write, &ia,
+			                               resources_table, opts);
+			data->count = mem_count;
+			data->type = rtapp_mem_write;
+		} else {
+			log_critical(PIN2 "Unknown memrun type: %s", mem_type);
+			goto unknown_event;
+		}
+
+		free(mem_type);
+		log_info(PIN2 "type %d count %d", data->type, data->count);
+		strncpy(data->name, ref, sizeof(data->name)-1);
+		free(tmp);
+		return;
+	}
+
 	if (!strncmp(name, "mem", strlen("mem")) ||
 			!strncmp(name, "iorun", strlen("iorun"))) {
 		if (!json_object_is_type(obj, json_type_int))
@@ -456,13 +708,13 @@ parse_task_event_data(char *name, struct json_object *obj,
 
 		/* create an unique name for per-thread buffer */
 		ref = create_unique_name(unique_name, sizeof(unique_name), "mem", tag);
-		i = get_resource_index(ref, rtapp_mem, resources_table, opts);
+		i = get_resource_index(ref, rtapp_mem, NULL, resources_table, opts);
 		data->res = i;
 		data->count = json_object_get_int(obj);
 
 		/* A single IO devices for all threads */
 		if (strncmp(name, "iorun", strlen("iorun")) == 0) {
-			i = get_resource_index("io_device", rtapp_iorun, resources_table, opts);
+			i = get_resource_index("io_device", rtapp_iorun, NULL, resources_table, opts);
 			data->dep = i;
 		};
 
@@ -483,7 +735,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 			goto unknown_event;
 
 		ref = json_object_get_string(obj);
-		i = get_resource_index(ref, rtapp_mutex, resources_table, opts);
+		i = get_resource_index(ref, rtapp_mutex, NULL, resources_table, opts);
 
 		data->res = i;
 
@@ -512,7 +764,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 			goto unknown_event;
 
 		ref = json_object_get_string(obj);
-		i = get_resource_index(ref, rtapp_wait, resources_table, opts);
+		i = get_resource_index(ref, rtapp_wait, NULL, resources_table, opts);
 
 		data->res = i;
 
@@ -533,7 +785,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 			data->type = rtapp_sig_and_wait;
 
 		tmp = get_string_value_from(obj, "ref", TRUE, "unknown");
-		i = get_resource_index(tmp, rtapp_wait, resources_table, opts);
+		i = get_resource_index(tmp, rtapp_wait, NULL, resources_table, opts);
 		/*
 		 * get_string_value_from allocate the string so with have to free it
 		 * once useless
@@ -543,7 +795,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 		data->res = i;
 
 		tmp = get_string_value_from(obj, "mutex", TRUE, "unknown");
-		i = get_resource_index(tmp, rtapp_mutex, resources_table, opts);
+		i = get_resource_index(tmp, rtapp_mutex, NULL, resources_table, opts);
 		/*
 		 * get_string_value_from allocate the string so with have to free it
 		 * once useless
@@ -561,7 +813,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 		return;
 	}
 
-    if (!strncmp(name, "barrier", strlen("barrier"))) {
+	if (!strncmp(name, "barrier", strlen("barrier"))) {
 
 		if (!json_object_is_type(obj, json_type_string))
 			goto unknown_event;
@@ -569,7 +821,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 		data->type = rtapp_barrier;
 
 		ref = json_object_get_string(obj);
-		i = get_resource_index(ref, rtapp_barrier, resources_table, opts);
+		i = get_resource_index(ref, rtapp_barrier, NULL, resources_table, opts);
 
 		data->res = i;
 		rdata = &((*resources_table)->resources[data->res]);
@@ -594,7 +846,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 			data->type = rtapp_timer;
 		}
 
-		data->res = get_resource_index(ref, data->type, resources_table, opts);
+		data->res = get_resource_index(ref, data->type, NULL, resources_table, opts);
 
 		/*
 		 * get_string_value_from allocate the string so with have to free it
@@ -626,11 +878,11 @@ parse_task_event_data(char *name, struct json_object *obj,
 
 		ref = json_object_get_string(obj);
 
-		i = get_resource_index(ref, rtapp_wait, resources_table, opts);
+		i = get_resource_index(ref, rtapp_wait, NULL, resources_table, opts);
 
 		data->res = i;
 
-		i = get_resource_index(ref, rtapp_mutex, resources_table, opts);
+		i = get_resource_index(ref, rtapp_mutex, NULL, resources_table, opts);
 
 		data->dep = i;
 
@@ -647,16 +899,13 @@ parse_task_event_data(char *name, struct json_object *obj,
 
 		data->type = rtapp_suspend;
 
-		if (!json_object_is_type(obj, json_type_string))
-			goto unknown_event;
+		ref = tdata->name;
 
-		ref = json_object_get_string(obj);
-
-		i = get_resource_index(ref, rtapp_wait, resources_table, opts);
+		i = get_resource_index(ref, rtapp_wait, NULL, resources_table, opts);
 
 		data->res = i;
 
-		i = get_resource_index(ref, rtapp_mutex, resources_table, opts);
+		i = get_resource_index(ref, rtapp_mutex, NULL, resources_table, opts);
 
 		data->dep = i;
 
@@ -685,7 +934,7 @@ parse_task_event_data(char *name, struct json_object *obj,
 
 		ref = json_object_get_string(obj);
 
-		i = get_resource_index(ref, rtapp_fork, resources_table, opts);
+		i = get_resource_index(ref, rtapp_fork, NULL, resources_table, opts);
 
 		data->res = i;
 
@@ -699,6 +948,46 @@ parse_task_event_data(char *name, struct json_object *obj,
 			log_error("Failed to duplicate ref");
 			exit(EXIT_FAILURE);
 		}
+
+		log_info(PIN2 "type %d target %s [%d]", data->type, rdata->name, rdata->index);
+		snprintf(data->name, sizeof(data->name)-1, "%s:%s",
+			 name, rdata->name);
+		return;
+	}
+
+	if (!strncmp(name, "sem_post", strlen("sem_post"))) {
+
+		data->type = rtapp_sem_post;
+
+		if (!json_object_is_type(obj, json_type_string))
+			goto unknown_event;
+
+		ref = json_object_get_string(obj);
+		i = get_resource_index(ref, rtapp_sem_post, NULL, resources_table, opts);
+
+		data->res = i;
+
+		rdata = &((*resources_table)->resources[data->res]);
+
+		log_info(PIN2 "type %d target %s [%d]", data->type, rdata->name, rdata->index);
+		snprintf(data->name, sizeof(data->name)-1, "%s:%s",
+			 name, rdata->name);
+		return;
+	}
+
+	if (!strncmp(name, "sem_wait", strlen("sem_wait"))) {
+
+		data->type = rtapp_sem_wait;
+
+		if (!json_object_is_type(obj, json_type_string))
+			goto unknown_event;
+
+		ref = json_object_get_string(obj);
+		i = get_resource_index(ref, rtapp_sem_post, NULL, resources_table, opts);
+
+		data->res = i;
+
+		rdata = &((*resources_table)->resources[data->res]);
 
 		log_info(PIN2 "type %d target %s [%d]", data->type, rdata->name, rdata->index);
 		snprintf(data->name, sizeof(data->name)-1, "%s:%s",
@@ -727,11 +1016,14 @@ static char *events[] = {
 	"timer",
 	"suspend",
 	"resume",
+	"memrun",
 	"mem",
 	"iorun",
 	"yield",
 	"barrier",
 	"fork",
+	"sem_post",
+	"sem_wait",
 	NULL
 };
 
@@ -850,11 +1142,10 @@ static sched_data_t *parse_sched_data(struct json_object *obj, int def_policy)
 	/* Get priority */
 	switch (tmp_data.policy) {
 	case same:
-		prior_def = THREAD_PRIORITY_UNCHANGED;
-		break;
 	case other:
+	case batch:
 	case idle:
-		prior_def = DEFAULT_THREAD_NICE;
+		prior_def = THREAD_PRIORITY_UNCHANGED;
 		break;
 	case fifo:
 	case rr:
@@ -903,14 +1194,14 @@ static sched_data_t *parse_sched_data(struct json_object *obj, int def_policy)
 	tmp_data.deadline *= 1000;
 
 	/* Check if we found at least one meaningful scheduler parameter */
-	if (tmp_data.prio != THREAD_PRIORITY_UNCHANGED ||
+	if (def_policy != same || tmp_data.prio != THREAD_PRIORITY_UNCHANGED ||
 	    tmp_data.runtime || tmp_data.period || tmp_data.deadline ||
 	    tmp_data.util_min != -1 || tmp_data.util_max != -1) {
 		sched_data_t *new_data;
 
 		/* At least 1 parameters has been set in the object */
 		new_data = malloc(sizeof(sched_data_t));
-		memcpy( new_data, &tmp_data,sizeof(sched_data_t));
+		memcpy(new_data, &tmp_data, sizeof(sched_data_t));
 
 		log_debug(PIN "key: set scheduler %d with priority %d", new_data->policy, new_data->prio);
 
@@ -962,13 +1253,13 @@ static void check_taskgroup_policy_dep(phase_data_t *pdata, thread_data_t *tdata
 
 	/*
 	 * Detect policy/taskgroup misconfiguration: a task which specifies a
-	 * taskgroup should not run in a policy other than SCHED_OTHER or
-	 * SCHED_IDLE.
+	 * taskgroup should not run in a policy other than SCHED_OTHER,
+	 * SCHED_BATCH, or SCHED_IDLE.
 	 */
 	if (tdata->curr_sched_data && tdata->curr_taskgroup_data) {
 		policy_t policy = tdata->curr_sched_data->policy;
 
-		if (policy != other && policy != idle) {
+		if (policy != other && policy != batch && policy != idle) {
 			log_critical(PIN2 "No taskgroup support for policy %s",
 			             policy_to_string(policy));
 			exit(EXIT_INV_CONFIG);

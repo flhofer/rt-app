@@ -64,7 +64,7 @@ static pthread_mutex_t joining_mutex;
 static pthread_mutex_t fork_mutex;
 
 static ftrace_data_t ft_data = {
-	.debugfs = "/sys/kernel/debug",
+	.tracefs = TRACEFS_PATH,
 	.marker_fd = -1,
 };
 
@@ -111,7 +111,7 @@ static void thread_data_set_unique_name(thread_data_t *tdata, int nforks)
 		tdata->name = strdup(tdata->name);
 	}
 
-	log_notice("thread_data_set_unique_name %d %s", tdata->ind, tdata->name);
+	log_notice("[%d] set unique thread name %s", tdata->ind, tdata->name);
 }
 
 /*
@@ -152,6 +152,9 @@ static int thread_data_create_unique_resources(thread_data_t *tdata, const threa
 static int create_thread(const thread_data_t *td, int index, int forked, int nforks)
 {
 	thread_data_t *tdata;
+	pthread_attr_t attr;
+	sigset_t sigset;
+	int ret = 0;
 
 	if (!td) {
 		log_error("Failed to create new thread, passed NULL thread_data_t: %s", td->name);
@@ -190,12 +193,22 @@ static int create_thread(const thread_data_t *td, int index, int forked, int nfo
 	/* save a pointer to thread's data */
 	threads[index].data = tdata;
 
-	if (pthread_create(&threads[index].thread, NULL, thread_body, (void*) tdata)) {
+	pthread_attr_init(&attr);
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGQUIT);
+	sigaddset(&sigset, SIGTERM);
+	sigaddset(&sigset, SIGHUP);
+	sigaddset(&sigset, SIGINT);
+	pthread_attr_setsigmask_np(&attr, &sigset);
+
+	if (pthread_create(&threads[index].thread, &attr, thread_body, (void*) tdata)) {
 		perror("Failed to create a thread");
-		return -1;
+		ret = -1;
 	}
 
-	return 0;
+	pthread_attr_destroy(&attr);
+
+	return ret;
 }
 
 /*
@@ -396,6 +409,58 @@ static void memload(unsigned long count, struct _rtapp_iomem_buf *iomem)
 	}
 }
 
+static void memread(unsigned long count, struct _rtapp_iomem_buf *iomem)
+{
+	volatile char *p = (volatile char *)iomem->ptr;
+	unsigned long buf_size = iomem->size;
+	unsigned long passes = count / buf_size;
+	unsigned long remainder = count % buf_size;
+	unsigned long i, j;
+
+	/*
+	 * p is volatile, so each access is a side effect that the compiler
+	 * must emit even when the value is discarded. No accumulator or ALU
+	 * op needed to keep the loads alive.
+	 */
+	for (i = 0; i < passes; i++)
+		for (j = 0; j < buf_size; j++)
+			(void)p[j];
+
+	for (j = 0; j < remainder; j++)
+		(void)p[j];
+}
+
+static void memwrite(unsigned long count, struct _rtapp_iomem_buf *iomem)
+{
+	volatile char *p = (volatile char *)iomem->ptr;
+	unsigned long buf_size = iomem->size;
+	unsigned long passes = count / buf_size;
+	unsigned long remainder = count % buf_size;
+	unsigned long i, j;
+
+	for (i = 0; i < passes; i++)
+		for (j = 0; j < buf_size; j++)
+			p[j] = (char)j;
+
+	for (j = 0; j < remainder; j++)
+		p[j] = (char)j;
+}
+
+static void memchase_run(unsigned long count, struct _rtapp_mem_chase_buf *chase)
+{
+	char **p = (char **)chase->base;
+	unsigned long i;
+
+	if (!p)
+		return;
+
+	for (i = 0; i < count; i++)
+		p = (char **)*p;
+
+	/* Prevent compiler from optimizing away the chases */
+	*(volatile char **)&chase->base = (char *)p;
+}
+
 static int run_event(event_data_t *event, int dry_run,
 		unsigned long *perf, thread_data_t *tdata,
 		struct timespec *t_first, log_data_t *ldata)
@@ -453,6 +518,7 @@ static int run_event(event_data_t *event, int dry_run,
 		pthread_cond_wait(&(rdata->res.cond.obj), &(ddata->res.mtx.obj));
 		break;
 	case rtapp_broadcast:
+		log_debug("broadcast %s ", rdata->name);
 		pthread_cond_broadcast(&(rdata->res.cond.obj));
 		break;
 	case rtapp_sleep:
@@ -554,6 +620,24 @@ static int run_event(event_data_t *event, int dry_run,
 			memload(event->count, &rdata->res.buf);
 		}
 		break;
+	case rtapp_mem_write:
+		{
+			log_debug("mem_write %d", event->count);
+			memwrite(event->count, &rdata->res.buf);
+		}
+		break;
+	case rtapp_mem_read:
+		{
+			log_debug("mem_read %d", event->count);
+			memread(event->count, &rdata->res.buf);
+		}
+		break;
+	case rtapp_mem_chase:
+		{
+			log_debug("mem_chase %d", event->count);
+			memchase_run(event->count, &rdata->res.chase);
+		}
+		break;
 	case rtapp_iorun:
 		{
 			log_debug("iorun %d", event->count);
@@ -620,6 +704,18 @@ static int run_event(event_data_t *event, int dry_run,
 			pthread_mutex_unlock(&fork_mutex);
 		}
 		break;
+	case rtapp_sem_post:
+		{
+			log_debug("sem_post %s", rdata->name);
+			sem_post(&rdata->res.sem.obj);
+		}
+		break;
+	case rtapp_sem_wait:
+		{
+			log_debug("sem_wait %s", rdata->name);
+			sem_wait(&rdata->res.sem.obj);
+		}
+		break;
 	default:
 		break;
 	}
@@ -654,27 +750,6 @@ int run(thread_data_t *tdata,
 	return perf;
 }
 
-static void wakeup_all_threads(void)
-{
-	int i;
-	int nresources = opts.resources->nresources;
-	rtapp_resource_t *resources = opts.resources->resources;
-
-	/*
-	 * Force wake up of all waiting threads.
-	 * At now we don't need to look into local resources because rtapp_wait
-	 * and rtapp_barrier are always global
-	 */
-	for (i = 0; i <  nresources; i++) {
-		if (resources[i].type == rtapp_wait) {
-			pthread_cond_broadcast(&resources[i].res.cond.obj);
-		}
-		if (resources[i].type == rtapp_barrier) {
-			pthread_cond_broadcast(&resources[i].res.barrier.c_obj);
-		}
-	}
-}
-
 static void setup_main_gnuplot(void);
 
 static void __shutdown(bool force_terminate)
@@ -686,7 +761,13 @@ static void __shutdown(bool force_terminate)
 
 	if (force_terminate) {
 		continue_running = 0;
-		wakeup_all_threads();
+
+		pthread_mutex_lock(&fork_mutex);
+
+		for (i = 0; i < running_threads; i++)
+			pthread_cancel(threads[i].thread);
+
+		pthread_mutex_unlock(&fork_mutex);
 	}
 
 	/*
@@ -912,20 +993,6 @@ static int __sched_priority(thread_data_t *data, sched_data_t *sched_data)
 	 return 0;
 }
 
-
-static void __log_policy_priority_change(thread_data_t *data,
-					 sched_data_t *sched_data)
-{
-	log_debug("[%d] setting scheduler %s priority %d", data->ind,
-		  policy_to_string(sched_data->policy),
-		  sched_data->prio);
-
-	log_ftrace(ft_data.marker_fd, FTRACE_ATTRS,
-		   "rtapp_attrs: event=policy policy=%s prio=%d",
-		   policy_to_string(sched_data->policy),
-		   sched_data->prio);
-}
-
 static bool __set_thread_policy_priority(thread_data_t *data,
 					 sched_data_t *sched_data)
 {
@@ -937,6 +1004,7 @@ static bool __set_thread_policy_priority(thread_data_t *data,
 	ret = pthread_setschedparam(pthread_self(),
 				    sched_data->policy,
 				    &param);
+
 	if (ret) {
 		log_critical("[%d] pthread_setschedparam returned %d",
 			     data->ind, ret);
@@ -944,33 +1012,86 @@ static bool __set_thread_policy_priority(thread_data_t *data,
 		perror("pthread_setschedparam");
 		exit(EXIT_FAILURE);
 	}
+
+	log_debug("[%d] setting scheduler %s priority %d", data->ind,
+		  policy_to_string(sched_data->policy), param.sched_priority);
+
+	log_ftrace(ft_data.marker_fd, FTRACE_ATTRS,
+		   "rtapp_attrs: event=policy policy=%s prio=%d",
+		   policy_to_string(sched_data->policy), param.sched_priority);
 }
 
-static void __set_thread_nice(thread_data_t *data, sched_data_t *sched_data)
+static void __set_thread_sched_other_attrs(thread_data_t *data,
+					   sched_data_t *sched_data)
 {
-	int ret;
+	int ret, prio_unchanged;
+	struct sched_attr sa_params = {0}, _sa_params = {0};
+	unsigned int flags = 0;
+	pid_t tid;
 
-	if (sched_data->prio > 19 || sched_data->prio < -20) {
-		log_critical("[%d] setpriority %d nice invalid. "
+	prio_unchanged = sched_data->prio == THREAD_PRIORITY_UNCHANGED;
+
+	if (prio_unchanged && !sched_data->runtime)
+		return;
+
+	if (!prio_unchanged && (sched_data->prio > 19 || sched_data->prio < -20)) {
+		log_critical("[%d] sched_setattr %d nice invalid. "
 			     "Valid between -20 and 19",
 			     data->ind, sched_data->prio);
 		exit(EXIT_FAILURE);
 	}
 
-	ret = setpriority(PRIO_PROCESS, 0, sched_data->prio);
+	if (prio_unchanged || !sched_data->runtime) {
+		_sa_params.size = sizeof(_sa_params);
+
+		if (sched_getattr(0, &_sa_params, sizeof(_sa_params), 0) == -1) {
+			perror("sched_getattr: failed to get SCHED_OTHER attributes");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	tid = gettid();
+	sa_params.size = sizeof(struct sched_attr);
+	sa_params.sched_policy = sched_data->policy;
+	sa_params.sched_priority = __sched_priority(data, sched_data);
+
+	/* In the CFS case, sched_data->prio is the NICE value. */
+	if (!prio_unchanged)
+		sa_params.sched_nice = sched_data->prio;
+	else
+		sa_params.sched_nice = _sa_params.sched_nice;
+
+	/*
+	 * Since Linux v6.12 it is possible to request a custom slice length
+	 * for tasks using a fair.c policy (other than SCHED_IDLE) via
+	 * sched_attr::sched_runtime.
+	 */
+	if (sched_data->runtime)
+		sa_params.sched_runtime = sched_data->runtime;
+	else
+		sa_params.sched_runtime = _sa_params.sched_runtime;
+
+	ret = sched_setattr(tid, &sa_params, flags);
 	if (ret) {
-		log_critical("[%d] setpriority returned %d", data->ind, ret);
+		log_critical("[%d] sched_setattr returned %d",
+			     data->ind, ret);
 		errno = ret;
-		perror("setpriority");
+		perror("sched_setattr: failed to set SCHED_OTHER attributes");
 		exit(EXIT_FAILURE);
 	}
+
+	log_debug("[%d] setting scheduler %s nice=%d runtime=%llu",
+		  data->ind, policy_to_string(sched_data->policy),
+		  sa_params.sched_nice, sa_params.sched_runtime);
+
+	log_ftrace(ft_data.marker_fd, FTRACE_ATTRS,
+		   "rtapp_attrs: event=policy policy=%s nice=%d runtime=%llu",
+		   policy_to_string(sched_data->policy), sa_params.sched_nice,
+		   sa_params.sched_runtime);
 }
 
 static void _set_thread_cfs(thread_data_t *data, sched_data_t *sched_data)
 {
-	/* Priority unchanged => Policy unchanged */
-	if (sched_data->prio == THREAD_PRIORITY_UNCHANGED)
-		return;
 	/*
 	 * In the CFS case, sched_data->prio is the NICE value. As long as the
 	 * policy hasn't changed, there's no need to call
@@ -983,10 +1104,8 @@ static void _set_thread_cfs(thread_data_t *data, sched_data_t *sched_data)
 	    (sched_data->policy != data->curr_sched_data->policy))
 		__set_thread_policy_priority(data, sched_data);
 
-	if (sched_data->policy == other)
-		__set_thread_nice(data, sched_data);
-
-	__log_policy_priority_change(data, sched_data);
+	if (sched_data->policy == other || sched_data->policy == batch)
+		__set_thread_sched_other_attrs(data, sched_data);
 }
 
 static void _set_thread_rt(thread_data_t *data, sched_data_t *sched_data)
@@ -996,7 +1115,6 @@ static void _set_thread_rt(thread_data_t *data, sched_data_t *sched_data)
 		return;
 
 	__set_thread_policy_priority(data, sched_data);
-	__log_policy_priority_change(data, sched_data);
 }
 
 /* deadline can't rely on the default __set_thread_policy_priority */
@@ -1021,7 +1139,6 @@ static void _set_thread_deadline(thread_data_t *data, sched_data_t *sched_data)
 
 	tid = gettid();
 	sa_params.size = sizeof(struct sched_attr);
-	sa_params.sched_flags = 0;
 	sa_params.sched_policy = SCHED_DEADLINE;
 	sa_params.sched_priority = __sched_priority(data, sched_data);
 	sa_params.sched_runtime = sched_data->runtime;
@@ -1103,6 +1220,7 @@ static void set_thread_param(thread_data_t *data, sched_data_t *sched_data)
 			_set_thread_uclamp(data, sched_data);
 			break;
 		case other:
+		case batch:
 		case idle:
 			_set_thread_cfs(data, sched_data);
 			_set_thread_uclamp(data, sched_data);
@@ -1161,17 +1279,6 @@ void *thread_body(void *arg)
 	}
 	timing_loop = 0;
 
-	/* Lock pages */
-	if (data->lock_pages == 1)
-	{
-		log_notice("[%d] Locking pages in memory", data->ind);
-		ret = mlockall(MCL_CURRENT | MCL_FUTURE);
-		if (ret != 0) {
-			perror("mlockall");
-			exit(EXIT_FAILURE);
-		}
-	}
-
 	if (data->ind == 0) {
 		/*
 		 * Only first thread sets t_zero. Other threads sync with this
@@ -1188,7 +1295,7 @@ void *thread_body(void *arg)
 
 	t_first = t_zero;
 
-	log_notice("[%d] starting thread ...\n", data->ind);
+	log_notice("[%d] starting thread %s", data->ind, data->name);
 
 	if (opts.logsize)
 		fprintf(data->log_handler, "%s %8s %8s %8s %15s %15s %15s %10s %10s %10s %10s\n",
@@ -1213,13 +1320,20 @@ void *thread_body(void *arg)
 	 * budget as little as possible for the first iteration.
 	 */
 
-	/* Set scheduling policy and print pretty info on stdout */
-	log_notice("[%d] Starting with %s policy with priority %d",
-			data->ind, policy_to_string(data->sched_data->policy),
-			data->sched_data->prio);
 	set_thread_param(data, data->sched_data);
 	set_thread_membind(data, &data->numa_data);
 	set_thread_taskgroup(data, data->taskgroup_data);
+
+	/* Lock pages */
+	if (data->lock_pages == 1)
+	{
+		log_notice("[%d] Locking pages in memory", data->ind);
+		ret = mlockall(MCL_CURRENT | MCL_FUTURE);
+		if (ret != 0) {
+			perror("mlockall");
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	/*
 	 * phase        - index of current phase in data->phases array
@@ -1318,14 +1432,9 @@ void *thread_body(void *arg)
 	}
 
 	param.sched_priority = 0;
-	ret = pthread_setschedparam(pthread_self(),
-				    SCHED_OTHER,
-				    &param);
-	if (ret != 0) {
-		errno = ret;
-		perror("pthread_setschedparam");
-		exit(EXIT_FAILURE);
-	}
+	pthread_setschedparam(pthread_self(),
+			      SCHED_OTHER,
+			      &param);
 
 	/* Force thread into root taskgroup. */
 	reset_thread_taskgroup();
@@ -1542,8 +1651,8 @@ int main(int argc, char* argv[])
 	if (ftrace_level != FTRACE_NONE) {
 		log_notice("configuring ftrace");
 		// check if tracing is enabled
-		strcpy(tmp, ft_data.debugfs);
-		strcat(tmp, "/tracing/tracing_on");
+		strcpy(tmp, ft_data.tracefs);
+		strcat(tmp, "/tracing_on");
 		int ftrace_f = open(tmp, O_RDONLY);
 		if (ftrace_f < 0){
 			log_error("Cannot open tracing_on file %s", tmp);
@@ -1557,8 +1666,8 @@ int main(int argc, char* argv[])
 		}
 		close(ftrace_f);
 		// set the marker
-		strcpy(tmp, ft_data.debugfs);
-		strcat(tmp, "/tracing/trace_marker");
+		strcpy(tmp, ft_data.tracefs);
+		strcat(tmp, "/trace_marker");
 		ft_data.marker_fd = open(tmp, O_WRONLY);
 		if (ft_data.marker_fd < 0) {
 			log_error("Cannot open trace_marker file %s", tmp);
@@ -1592,9 +1701,6 @@ int main(int argc, char* argv[])
 	add_cgroups();
 
 	/* Take the beginning time for everything */
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-	/* Sync timer resources with start time */
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	/* Start the use case */

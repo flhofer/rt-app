@@ -25,11 +25,16 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 /* For cpu_set_t type */
 #define _GNU_SOURCE
 #include <sched.h>
+#include <linux/sched.h>
 
 #include <pthread.h>
+#include <semaphore.h>
 #include <limits.h>
 #include "config.h"
+
+#ifndef HAVE_SCHED_SETATTR
 #include "dl_syscalls.h"
+#endif
 
 #if HAVE_LIBNUMA
 #include <numa.h>
@@ -40,7 +45,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define RTAPP_FTRACE_PATH_LENGTH 256
 
 #define DEFAULT_THREAD_PRIORITY 10
-#define DEFAULT_THREAD_NICE 0
 #define THREAD_PRIORITY_UNCHANGED INT_MAX
 
 #define PATH_LENGTH 256
@@ -51,8 +55,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define EXIT_INV_CONFIG 2
 #define EXIT_INV_COMMANDLINE 3
 
-/* SCHED_IDLE is not available if __USE_GNU is not defined */
+/* SCHED_BATCH and SCHED_IDLE are not available if __USE_GNU is not defined */
 #ifndef __USE_GNU
+#define SCHED_BATCH 3
 #define SCHED_IDLE 5
 #endif
 
@@ -61,6 +66,7 @@ struct _thread_data_t;
 typedef enum policy_t
 {
 	other = SCHED_OTHER,
+	batch = SCHED_BATCH,
 	idle = SCHED_IDLE,
 	rr = SCHED_RR,
 	fifo = SCHED_FIFO,
@@ -85,11 +91,16 @@ typedef enum resource_t
 	rtapp_suspend,
 	rtapp_resume,
 	rtapp_mem,
+	rtapp_mem_write,
+	rtapp_mem_read,
+	rtapp_mem_chase,
 	rtapp_iorun,
 	rtapp_runtime,
 	rtapp_yield,
 	rtapp_barrier,
-	rtapp_fork
+	rtapp_fork,
+	rtapp_sem_wait,
+	rtapp_sem_post
 } resource_t;
 
 struct _rtapp_mutex {
@@ -131,6 +142,13 @@ struct _rtapp_iomem_buf {
 	int size;
 };
 
+struct _rtapp_mem_chase_buf {
+	char *base;		/* aligned buffer */
+	size_t size;		/* buffer size in bytes */
+	size_t stride;		/* bytes between pointer positions */
+	int random;		/* 1 = bit-reversed, 0 = sequential */
+};
+
 struct _rtapp_iodev {
 	int fd;
 };
@@ -141,6 +159,10 @@ struct _rtapp_fork {
 	int nforks;
 };
 
+struct _rtapp_sem {
+	sem_t obj;
+};
+
 /* Shared resources */
 typedef struct _rtapp_resource_t {
 	union {
@@ -149,9 +171,11 @@ typedef struct _rtapp_resource_t {
 		struct _rtapp_signal signal;
 		struct _rtapp_timer timer;
 		struct _rtapp_iomem_buf buf;
+		struct _rtapp_mem_chase_buf chase;
 		struct _rtapp_iodev dev;
 		struct _rtapp_barrier_like barrier;
 		struct _rtapp_fork fork;
+		struct _rtapp_sem sem;
 	} res;
 	int index;
 	resource_t type;
@@ -250,7 +274,7 @@ typedef struct _pthread_data_t {
 } pthread_data_t;
 
 typedef struct _ftrace_data_t {
-	char *debugfs;
+	char *tracefs;
 	int trace_fd;
 	int marker_fd;
 } ftrace_data_t;

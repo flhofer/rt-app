@@ -19,12 +19,15 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "rt-app_utils.h"
 
@@ -173,6 +176,8 @@ string_to_policy(const char *policy_name, policy_t *policy)
 {
 	if (strcmp(policy_name, "SCHED_OTHER") == 0)
 		*policy = other;
+	else if (strcmp(policy_name, "SCHED_BATCH") == 0)
+		*policy = batch;
 	else if (strcmp(policy_name, "SCHED_IDLE") == 0)
 		*policy = idle;
 	else if (strcmp(policy_name, "SCHED_RR") == 0)
@@ -192,6 +197,8 @@ policy_to_string(policy_t policy)
 	switch (policy) {
 		case other:
 			return "SCHED_OTHER";
+		case batch:
+			return "SCHED_BATCH";
 		case idle:
 			return "SCHED_IDLE";
 		case rr:

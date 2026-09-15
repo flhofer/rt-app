@@ -3,7 +3,7 @@ HOW-TO use rt-app and workgen to emulate a workload ?
 **** rt-app and workgen ****
 rt-app/workgen is a tool that can be used to emulate a use case. Not only the
 sleep and run pattern can be emulated but also the dependency between tasks
-like accessing same critical resources, creating sequencial wake up or syncing
+like accessing same critical resources, creating sequential wake up or syncing
 the wake up of threads. The use case is described in a json like file which is
 first parsed by workgen then rt-app.
 
@@ -47,7 +47,7 @@ step and uses the integer value as ns per loop.
 * default_policy : String. Default scheduling policy of threads. Default
 value is SCHED_OTHER.
 
-* pi_enabled: Boolean. Enable the prority inheritance of mutex. Default value
+* pi_enabled: Boolean. Enable the priority inheritance of mutex. Default value
 is False.
 
 * lock_pages : Boolean. Lock the mem page in RAM. Locking the page in RAM
@@ -63,12 +63,12 @@ the current directory (./). Directory must be already existing.
 
 * log_size : String or Integer. A Integer defines a fix size in MB of the
 temporary buffer (size per thread) that will be used to store the log data
-before saving them in a file. This temporary buffer is used as a cicular
+before saving them in a file. This temporary buffer is used as a circular
 buffer so the oldest data will be lost in case of overflow. A string is used
-to set a predifined behavior:
+to set a predefined behavior:
   - "file" will be used to store the log data directly in the file without
 	using a temporary buffer.
-  - "Disable" will disable the log mecahnism.
+  - "Disable" will disable the log mechanism.
   - "Auto" will let rt-app compute the buffer size to not overflow the latter
 	during the use case.
 The use of a temporary buffer prevents the threads of unexpected wait during
@@ -203,11 +203,12 @@ is set after the thread creation if nothing has been defined. Then, the
 scheduling properties can be changed at the beginning of each phase if it has
 been defined in the phase object. The behavior is quite similar to an event as
 a update happens only if one of the scheduling parameters has been set
-otherwise the scheduling paraleters will stay unchanged
+otherwise the scheduling parameters will stay unchanged
 
 * policy : String. Define the scheduling policy of the thread. default_policy
 is used if not defined. Accepted value are:
   - "SCHED_OTHER"
+  - "SCHED_BATCH"
   - "SCHED_IDLE"
   - "SCHED_RR"
   - "SCHED_FIFO"
@@ -221,6 +222,9 @@ must be aligned with the range allowed by the policy. The default priority is
 Default value is 0. The unit is usec.  For backward compatibility, the
 key "runtime" will also be checked in thread object but special must be taken
 as this can conflict with runtime event.
+
+Since Linux 6.12 this parameter also applies to the SCHED_OTHER scheduling
+class. It is used to request a custom slice length for the thread.
 
 * dl-period : Integer. Define the period duration for deadline scheduling class.
 Default value is runtime. The unit is usec. For backward compatibility, the
@@ -326,7 +330,8 @@ and don't do anything otherwise.
 *** taskgroups
 
 * taskgroup: String. Can be specified at task level or phase level. Currently
-only SCHED_OTHER and SCHED_IDLE tasks are supported to contain taskgroup data.
+only SCHED_OTHER, SCHED_BATCH and SCHED_IDLE tasks are supported to contain
+taskgroup data.
 Tasks with a different policy and without taskgroup data can coexist in the
 setup. An empty taskgroup ("") is allowed and is interpreted as if there is
 no taskgroup data given. Pre-existing parts of a taskgroup are preserved.
@@ -369,6 +374,76 @@ defined by "mem_buffer_size" in "global" object.
 in byte to be write into the IO device specified by "io_device" in "global"
 object.
 
+* memrun : Object. Memory access workloads with finer control than "mem".
+The "type" field selects one of "read", "write", or "chase". All variants
+take a "size" field (per-event buffer allocation in bytes, independent of
+the global "mem_buffer_size") and a "count" field whose meaning depends
+on the type.
+
+memrun "read" and "write" do sequential byte-at-a-time access of "count"
+bytes from the buffer, wrapping to offset 0 if count > size.
+
+memrun "chase" does pointer-chasing through a circular linked list of
+pointers placed every "stride" bytes in the buffer. "count" is the
+number of pointer dereferences (one chain hop each). The chain layout is
+controlled by:
+
+  - "stride" : Integer. Bytes between adjacent chain positions. Default 64.
+  - "pattern" : String. Either "random" (default), which uses bit-reversed
+    pointer ordering to defeat hardware prefetchers, or "sequential",
+    which orders the chain by linear stride.
+
+The legacy "mem" event is unchanged for backward compatibility.
+
+Optional "ref" field for cross-thread sharing: similar to the "unique"
+pattern for timer (but inverted), memrun events default to per-thread
+isolated buffers. Adding "ref" : "<name>" to a memrun event opts into
+sharing: the resource lookup uses the user-provided name verbatim, so
+multiple tasks (and their threads) using the same name share one
+underlying buffer.
+
+Sharing decouples the aggregate working set from the thread count,
+which is useful in two main cases:
+
+  - Pinning the working set to a target cache level. If you want N
+    threads to all hit (say) L3, the working set must fit in L3.
+    With per-thread buffers of size B, the aggregate is N*B and easily
+    exceeds L3, producing misses instead of hits. A single shared
+    buffer of size <= L3 keeps the working set bounded regardless of N,
+    so all threads hit L3 after warmup.
+
+  - Avoiding OOM with large per-thread buffers. Many threads each
+    wanting a 32 MB chase buffer to generate cache misses (e.g. 100
+    threads * 32 MB = 3.2 GB) OOMs typical devices. One shared 32 MB
+    buffer still exceeds cache for the aggregate working set, so
+    cache-miss behavior is preserved while memory cost stays constant.
+
+Two memrun events using the same "ref" must agree on size/stride/pattern;
+otherwise rt-app exits with EXIT_INV_CONFIG at parse time.
+
+    "tasks" : {
+        "thread_a" : {
+            "phases" : {
+                "p" : {
+                    "memrun_a" : { "type" : "chase", "size" : 33554432,
+                                   "stride" : 64, "pattern" : "random",
+                                   "count" : 1000,
+                                   "ref" : "shared_chase_r_64_33554432" }
+                }
+            }
+        },
+        "thread_b" : {
+            "phases" : {
+                "p" : {
+                    "memrun_b" : { "type" : "chase", "size" : 33554432,
+                                   "stride" : 64, "pattern" : "random",
+                                   "count" : 1000,
+                                   "ref" : "shared_chase_r_64_33554432" }
+                }
+            }
+        }
+    }
+
 * timer : Object. Emulate the wake up of the thread by a timer. Timer differs
 from sleep event by the start time of the timer duration. Sleep duration starts
 at the beginning of the sleep event whereas timer duration starts at the end of
@@ -394,7 +469,7 @@ We can see that task B period stays to 19 even if the run event is delayed
 because of scheduling preemption whereas the period of task A starts at 15 but
 increases to 19 because of the scheduling delay.
 
-"unique" timer device: When a thread that uses a timer is instanciated, the
+"unique" timer device: When a thread that uses a timer is instantiated, the
 timer will be shared across the thread instance which disturbs the original
 sequence. In order to have 1 timer per instance, you can use the "unique"
 prefix so a new timer will be created for each instance. Uniqueness
@@ -430,7 +505,7 @@ below:
 	}
 
 Timers can work with a "relative" or an "absolute" reference. By default they
-work in "relative" mode, but this mode can also be explicity specified as the
+work in "relative" mode, but this mode can also be explicitly specified as the
 following:
 
 	"phases" : {
@@ -544,7 +619,7 @@ variable shared between users to track waiting tasks, protected by the mutex.
 You must use a unique name for each sync event since the number of users is
 taken from the number of references to the name in the input json. i.e. each
 name must represent a single sync point, and be shared amongst all threads
-which wish to syncronise at that point.
+which wish to synchronize at that point.
 
 The barrier event "barrier" : "SyncPointA"
 generates the following sequence:
@@ -561,13 +636,27 @@ generates the following sequence:
 }
 
 * suspend : String. Block the calling thread until another thread wakes it up
-with resume. The String can be let empty as it will be filled by workgen with
-the right thread's name before starting the use case.
+with resume. String is ignored.
 
 * resume : String. Wake up the thread defined by the string.
 
 taskA ...|run 5|suspend |----------------|run 5|suspend |----------------
 taskB ...-------------------|resume taskA|run 10    |--------------------
+
+* sem_post : String. Increment the POSIX semaphore named by the string.
+Never blocks. If a thread is blocked in sem_wait on the same semaphore,
+one is woken; otherwise the count increments and the post is remembered
+for a later sem_wait. Initial count is 0.
+
+* sem_wait : String. Decrement the POSIX semaphore named by the string,
+or block until count > 0. Unlike suspend/resume and signal/wait, the
+sem_post/sem_wait pair has memory: posts that arrive before any waiter
+is blocked accumulate, so a later wait consumes the count without
+blocking. This is the right primitive when an upstream thread may run
+ahead of the downstream waiter, e.g. pipeline patterns where the poster
+can complete several iterations before a preempted consumer gets to run.
+Both sem_post and sem_wait events using the same name reference the same
+underlying semaphore.
 
 * yield: String. Calls pthread_yield(), freeing the CPU for other tasks. This has a
 special meaning for SCHED_DEADLINE tasks. String can be empty.
@@ -671,7 +760,7 @@ The generated events are of these main categories:
 
 You can log some metrics for each phase that is executed by a thread. These
 metrics are:
-- perf: fixed amount of work perfomed during a phase (c_duration/calibration)
+- perf: fixed amount of work performed during a phase (c_duration/calibration)
   (see events/run above) [number of 1000 loops, each pLoad]
 - run: time spent by the thread to execute the run events [us]
 - period: duration to execute the complete phase [us]
